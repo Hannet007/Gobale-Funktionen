@@ -24,8 +24,7 @@ using System.Globalization;
 /// <summary>
 /// Version: 2.0.1
 /// -------------------------------------------------------------------------
-/// Simon Pucher 2018
-/// Christian Kovar 2018
+// umgebaute version 
 /// -------------------------------------------------------------------------
 /// Global utilities as a helper in Agena Trader Script.
 /// -------------------------------------------------------------------------
