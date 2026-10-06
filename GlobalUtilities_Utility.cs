@@ -22,9 +22,19 @@ using System.Net;
 using System.Globalization;
 
 /// <summary>
-/// Version: 2.0.1
+/// Version: 2.2.0 (Weiterentwicklung der Version 2.0.1)
+/// -------------------------------------------------------------------------
+/// Simon Pucher 2018
+/// Christian Kovar 2018
 /// -------------------------------------------------------------------------
 // umgebaute version die verändert jetzt wirt damit sie wieder past denn das hier ist alles veraldet und muss angepasst werden !
+/// -------------------------------------------------------------------------
+/// Änderungen ab 2.1.0 (alle bestehenden Methodennamen bleiben unverändert):
+/// - NEU in 2.2.0: CalculatePositionSize (Menge aus Risiko-Einstellungen des Kontos und Stop-Abstand, für Aktien/ETF und CFD).
+/// - StringExtensions.CleanFileName: Endlosrekursion behoben.
+/// - GetTargetBar: beliebige Minuten-/Stundenwerte, Abbruchschutz gegen Endlosschleife.
+/// - AdjustPositionToRiskManagement: keine NotImplementedException mehr, stattdessen Menge 0 plus Warntext (Überladung mit out-Parameter).
+/// - Drei beschädigte Umlaute in Kommentaren korrigiert.
 /// -------------------------------------------------------------------------
 /// Global utilities as a helper in Agena Trader Script.
 /// -------------------------------------------------------------------------
@@ -32,7 +42,7 @@ using System.Globalization;
 /// </summary>
 namespace AgenaTrader.UserCode
 {
-  
+
 
     #region Constants
 
@@ -138,7 +148,8 @@ namespace AgenaTrader.UserCode
         /// </summary>
         /// <param name="soundfile"></param>
         /// <returns></returns>
-        public static string GetSoundfile(Soundfile soundfile) {
+        public static string GetSoundfile(Soundfile soundfile)
+        {
             string returnfilename = null;
             returnfilename = soundfile.ToString().Replace("_", "-");
             returnfilename = returnfilename + ".wav";
@@ -172,7 +183,7 @@ namespace AgenaTrader.UserCode
         {
             return Color.FromArgb((int)(originalColour.A * opacityFactor), originalColour.R, originalColour.G, originalColour.B);
         }
- 
+
 
         #endregion
 
@@ -277,7 +288,8 @@ namespace AgenaTrader.UserCode
         /// <param name="current"></param>
         /// <param name="target"></param>
         /// <returns></returns>
-        public static decimal MoneyExchange(double cashamount, Currencies current, Currencies target) {
+        public static decimal MoneyExchange(double cashamount, Currencies current, Currencies target)
+        {
             return new Money(cashamount, current).ConvertToCurrency(target).RoundedAmount;
         }
 
@@ -288,11 +300,30 @@ namespace AgenaTrader.UserCode
         /// <returns></returns>
         public static int AdjustPositionToRiskManagement(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double lastprice)
         {
+            string warning;
+            return AdjustPositionToRiskManagement(accountmanager, preferencemanager, instrument, lastprice, out warning);
+        }
+
+        /// <summary>
+        /// Wie oben, liefert aber zusätzlich einen Warntext. Menge 0 bedeutet: keine Order platzieren.
+        /// Es wird keine Exception mehr geworfen, wenn Modus oder Instrumenttyp nicht unterstützt werden.
+        /// </summary>
+        public static int AdjustPositionToRiskManagement(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double lastprice, out string warning)
+        {
+            warning = string.Empty;
+
             //Get Risk Management from Account
             IAccount account = accountmanager.GetAccount(instrument, true, true);
             if (account == null)
             {
                 return instrument.GetDefaultQuantity();
+            }
+
+            //Ohne gültigen Kurs kann keine Menge berechnet werden (Division durch 0 vermeiden)
+            if (lastprice <= 0)
+            {
+                warning = "AdjustPositionToRiskManagement: ungültiger Kurs (" + lastprice.ToString() + "), Menge 0";
+                return 0;
             }
 
             //get the RiskParams on this account connection
@@ -315,13 +346,13 @@ namespace AgenaTrader.UserCode
             }
             else
             {
-                throw new NotImplementedException("AdjustPositionToRiskManagement: BasePositionSizing " + irp.BasePositionSizing.ToString() + " not implemented", null);
+                warning = "AdjustPositionToRiskManagement: BasePositionSizing " + irp.BasePositionSizing.ToString() + " wird nicht unterstützt, Menge 0";
+                return 0;
             }
 
             //Check the type of instrument & return the position size
             if (instrument.InstrumentType == InstrumentType.Index)
             {
-                //return 1;
                 return instrument.GetDefaultQuantity();
             }
             if (instrument.InstrumentType == InstrumentType.Stock
@@ -329,15 +360,153 @@ namespace AgenaTrader.UserCode
             {
                 return (int)Math.Floor(decimal.ToDouble(MoneyExchange(maxpositionsizeincash, account.Currency, instrument.Currency)) / lastprice);
             }
-            else if (instrument.InstrumentType == InstrumentType.CFD)
+
+            warning = "AdjustPositionToRiskManagement: InstrumentType " + instrument.InstrumentType.ToString() + " wird noch nicht unterstützt, Menge 0";
+            return 0;
+        }
+
+        /// <summary>
+        /// Berechnet die Positionsgröße (Stückzahl) anhand der Risiko-Einstellungen der Konto-Verbindung in AgenaTrader.
+        /// Unterstützt werden die Modi OnInitialRisk (Risiko in %), OnRiskAmountPerTrade (Risikobetrag) und OnAmountPerPosition (Fixbetrag)
+        /// für Aktien/ETF (Stock) und CFD. Alle Beträge werden in der Kontowährung gerechnet.
+        /// Rückgabe 0 bedeutet: keine Order platzieren (Grund steht im Warntext).
+        /// Ohne Konto (z.B. Backtest) wird die Standardmenge des Instruments zurückgegeben.
+        /// </summary>
+        /// <param name="entryprice">geplanter Einstiegskurs</param>
+        /// <param name="stopprice">geplanter Stop-Kurs (bei Long unter, bei Short über dem Einstieg)</param>
+        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice)
+        {
+            string warning;
+            return CalculatePositionSize(accountmanager, preferencemanager, instrument, entryprice, stopprice, out warning);
+        }
+
+        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice, out string warning)
+        {
+            warning = string.Empty;
+
+            //Konto der Verbindung holen, auf dem gehandelt wird
+            IAccount account = accountmanager.GetAccount(instrument, true, true);
+            if (account == null)
             {
+                warning = "CalculatePositionSize: kein Konto gefunden (Backtest?), Standardmenge wird verwendet";
                 return instrument.GetDefaultQuantity();
             }
-            else
+
+            if (entryprice <= 0)
             {
-                throw new NotImplementedException("AdjustPositionToRiskManagement: InstrumentType " + instrument.InstrumentType.ToString() + " not implemented", null);
+                warning = "CalculatePositionSize: ungültiger Einstiegskurs (" + entryprice.ToString() + "), Menge 0";
+                return 0;
             }
 
+            //Forex (Currency) folgt später, andere Typen werden nicht unterstützt
+            InstrumentType type = instrument.InstrumentType;
+            if (type != InstrumentType.Stock && type != InstrumentType.CFD)
+            {
+                warning = "CalculatePositionSize: InstrumentType " + type.ToString() + " wird noch nicht unterstützt, Menge 0";
+                return 0;
+            }
+
+            //Risiko-Einstellungen dieser Konto-Verbindung für den Instrumenttyp
+            ConnectionRiskParams crp = preferencemanager.GetConnectionRiskParams(account.AccountConnection.ConnectionName);
+            InstrumentRiskParams irp = crp.InstrumentRiskParams[type];
+
+            //Wechselkurs Instrumentwährung -> Kontowährung (z.B. USD -> EUR)
+            double fx = GetExchangeRate(instrument.Currency, account.Currency);
+            if (fx <= 0)
+            {
+                warning = "CalculatePositionSize: Wechselkurs nicht verfügbar, Menge 0";
+                return 0;
+            }
+            double priceInAccountCurrency = entryprice * fx; //Preis pro Stück in Kontowährung
+
+            double quantity;
+            switch (irp.BasePositionSizing)
+            {
+                case BasePositionSizing.OnAmountPerPosition:
+                    //Fixbetrag pro Position, der Stop spielt keine Rolle
+                    quantity = irp.InvestedAmountPerPosition / priceInAccountCurrency;
+                    break;
+
+                case BasePositionSizing.OnInitialRisk:
+                case BasePositionSizing.OnRiskAmountPerTrade:
+                    {
+                        //Verlust pro Stück bis zum Stop, in Kontowährung
+                        double distance = Math.Abs(entryprice - stopprice);
+                        if (stopprice <= 0 || distance <= 0)
+                        {
+                            warning = "CalculatePositionSize: ungültiger Stop-Abstand, Menge 0";
+                            return 0;
+                        }
+
+                        double riskamount;
+                        if (irp.BasePositionSizing == BasePositionSizing.OnInitialRisk)
+                        {
+                            //Risiko in % vom Kapital (Kapitalbasis laut Einstellung: BuyingPower oder CashValue)
+                            riskamount = GetCapitalBase(account, irp.RiskPerTradeSource) / 100.0 * irp.RiskPerTrade;
+                        }
+                        else
+                        {
+                            //fester Risikobetrag pro Trade
+                            riskamount = irp.RiskAmountPerTrade;
+                        }
+
+                        quantity = riskamount / (distance * fx);
+                        break;
+                    }
+
+                default:
+                    warning = "CalculatePositionSize: BasePositionSizing " + irp.BasePositionSizing.ToString() + " wird nicht unterstützt, Menge 0";
+                    return 0;
+            }
+
+            //Obergrenzen (in Kontowährung): nie mehr als die Kaufkraft, die Einstellung "maximale Investition in %" und der Maximalwert pro Position
+            double maxinvested = (double)account.BuyingPower;
+            if (irp.MaxInvestedAmountPercentage > 0)
+            {
+                maxinvested = Math.Min(maxinvested, (double)account.BuyingPower / 100.0 * irp.MaxInvestedAmountPercentage);
+            }
+            //Dieses Feld liegt in ConnectionRiskParams (pro Verbindung), nicht in InstrumentRiskParams
+            if (crp.MaxInvestedAmountPerPosition > 0)
+            {
+                maxinvested = Math.Min(maxinvested, (double)crp.MaxInvestedAmountPerPosition);
+            }
+            double maxquantity = maxinvested / priceInAccountCurrency;
+            if (quantity > maxquantity)
+            {
+                quantity = maxquantity;
+            }
+
+            if (quantity > int.MaxValue) quantity = int.MaxValue;
+            int result = (int)Math.Floor(quantity);
+            if (result < 1)
+            {
+                warning = "CalculatePositionSize: Kapital bzw. Risiko reicht für kein ganzes Stück, Menge 0";
+                return 0;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Kapitalbasis je nach Einstellung (BuyingPower oder CashValue).
+        /// </summary>
+        private static double GetCapitalBase(IAccount account, BaseRiskSource source)
+        {
+            if (source == BaseRiskSource.CashValue)
+            {
+                return (double)account.CashValue;
+            }
+            return (double)account.BuyingPower;
+        }
+
+        /// <summary>
+        /// Wechselkurs von einer Währung in eine andere. Es wird ein großer Betrag umgerechnet,
+        /// weil MoneyExchange auf Cent rundet und ein kleiner Betrag den Kurs verfälschen würde.
+        /// </summary>
+        private static double GetExchangeRate(Currencies from, Currencies to)
+        {
+            if (from == to) return 1.0;
+            decimal converted = MoneyExchange(10000.0, from, to);
+            return decimal.ToDouble(converted) / 10000.0;
         }
 
         public static TimeSpan GetOfficialMarketOpeningTime(string Symbol)
@@ -423,19 +592,19 @@ namespace AgenaTrader.UserCode
             {
                 string url = "http://www.onvista.de/index/VDAX-NEW-Index-12105789";
 
-                //Anfrage an die �bergebene URL starten
+                //Anfrage an die übergebene URL starten
                 HttpWebRequest request = (HttpWebRequest)HttpWebRequest.Create(url);
 
                 //Antwort-Objekt erstellen
                 HttpWebResponse response = (HttpWebResponse)request.GetResponse();
 
-                //Antwort Stream an Streamreader �bergeben
+                //Antwort Stream an Streamreader übergeben
                 StreamReader sr = new StreamReader(response.GetResponseStream());
 
                 //Antwort (HTML Code) auslesen
                 string html = sr.ReadToEnd();
 
-                //Streamreader und Webanfrage schlie�en
+                //Streamreader und Webanfrage schließen
                 sr.Close();
                 response.Close();
 
@@ -447,11 +616,11 @@ namespace AgenaTrader.UserCode
                 string _vdax_new_string_value = (html.Substring(EndOfValue - 6, 5));
 
                 _vdax_new_string_value = _vdax_new_string_value.Replace(",", CultureInfo.InvariantCulture.NumberFormat.NumberDecimalSeparator);
-                _vdax_new_value =  decimal.Parse(_vdax_new_string_value, NumberStyles.Any, CultureInfo.InvariantCulture);
+                _vdax_new_value = decimal.Parse(_vdax_new_string_value, NumberStyles.Any, CultureInfo.InvariantCulture);
 
                 _vdax_new_lastcheck = DateTime.Now;
             }
-            
+
             return _vdax_new_value;
 
         }
@@ -501,6 +670,7 @@ namespace AgenaTrader.UserCode
 
         /// <summary>
         /// HighestHigh Method is not available in Conditions, therefore this alternative can be used
+        /// Hinweis: Gezählt wird ab Bars[1], die aktuelle Bar (Bars[0]) ist NICHT enthalten.
         /// </summary>
         /// <param name="Bars"></param>
         /// <param name="BarsAgo"></param>
@@ -519,6 +689,7 @@ namespace AgenaTrader.UserCode
 
         /// <summary>
         /// LowestLow Method is not available in Conditions, therefore this alternative can be used
+        /// Hinweis: Gezählt wird ab Bars[1], die aktuelle Bar (Bars[0]) ist NICHT enthalten.
         /// </summary>
         /// <param name="Bars"></param>
         /// <param name="BarsAgo"></param>
@@ -548,37 +719,23 @@ namespace AgenaTrader.UserCode
         {
             DateTime Target = CurrentBarDateTime;
             int i = 0;
+            int schutz = 0; // Abbruchschutz, damit die Schleife nie endlos laufen kann
             do
             {
+                schutz++;
+                if (schutz > 200000) return DateTime.MinValue;
+
                 switch (timeFrame.Periodicity)
                 {
                     case DatafeedHistoryPeriodicity.Minute:
-                        switch (timeFrame.PeriodicityValue)
-                        {
-                            case 1:
-                                Target = Target.AddMinutes(1);
-                                break;
-                            case 5:
-                                Target = Target.AddMinutes(5);
-                                break;
-                            case 15:
-                                Target = Target.AddMinutes(15);
-                                break;
-                            case 30:
-                                Target = Target.AddMinutes(30);
-                                break;
-                        }
+                        // Beliebiger Minutenwert (z.B. 1, 5, 10, 15, 30, 45 ...)
+                        if (timeFrame.PeriodicityValue < 1) return DateTime.MinValue;
+                        Target = Target.AddMinutes(timeFrame.PeriodicityValue);
                         break;
                     case DatafeedHistoryPeriodicity.Hour:
-                        switch (timeFrame.PeriodicityValue)
-                        {
-                            case 1:
-                                Target = Target.AddHours(1);
-                                break;
-                            case 5:
-                                Target = Target.AddHours(4);
-                                break;
-                        }
+                        // Beliebiger Stundenwert (z.B. 1, 2, 4 ...)
+                        if (timeFrame.PeriodicityValue < 1) return DateTime.MinValue;
+                        Target = Target.AddHours(timeFrame.PeriodicityValue);
                         break;
 
                     case DatafeedHistoryPeriodicity.Day:
@@ -701,12 +858,14 @@ namespace AgenaTrader.UserCode
 
         static public decimal getPercentage(double whole, double part)
         {
-            if (whole != 0) {
-            return (decimal)((part / whole) * 100);
-            } else
-	{
+            if (whole != 0)
+            {
+                return (decimal)((part / whole) * 100);
+            }
+            else
+            {
                 return 0;
-	}
+            }
         }
 
         static public double getMinPosNumber(double n1, double n2, double n3)
@@ -721,7 +880,7 @@ namespace AgenaTrader.UserCode
             numbers.RemoveAll(x => x <= 0);
             return numbers.Min();
 
-            
+
         }
 
         static public double getMaxNumber(double n1, double n2, double n3)
@@ -990,11 +1149,13 @@ namespace AgenaTrader.UserCode
     /// <summary>
     /// Statistic object  to compare the performance of strategies.
     /// </summary>
-    public class StatisticContainer {
+    public class StatisticContainer
+    {
 
         private List<Statistic> List = null;
 
-        public StatisticContainer() {
+        public StatisticContainer()
+        {
             this.List = new List<Statistic>();
         }
 
@@ -1010,7 +1171,7 @@ namespace AgenaTrader.UserCode
             //Set the counter, we are starting at 0
             statistic.Counter = this.List.Count;
             //Add the item to the list
-            this.List.Add(statistic); 
+            this.List.Add(statistic);
         }
 
 
@@ -1110,7 +1271,7 @@ namespace AgenaTrader.UserCode
                     this.TradeDirection = trade.EntryOrder.IsLong ? PositionType.Long : PositionType.Short;
                     this.TimeFrame = execution.Order.TimeFrame.ToString();
                     this.ProfitLoss = trade.ProfitLoss;
-                    this.ProfitLossPercent = trade.ProfitLossPercent; 
+                    this.ProfitLossPercent = trade.ProfitLossPercent;
                     this.ExitReason = trade.ExitReason;
                     this.ExitPrice = trade.ExitPrice;
                     //this.ExitDateTime = execution.Time;
@@ -1126,7 +1287,7 @@ namespace AgenaTrader.UserCode
                     //everything is fine
                     this.IsValid = true;
                 }
-                
+
                 //we do not have a target.
                 //this.TargetPrice   
             }
@@ -1144,7 +1305,7 @@ namespace AgenaTrader.UserCode
         /// <param name="execution"></param>
         public Statistic(IStrategy strategy, PositionType positiontype)
         {
-           //Log all data
+            //Log all data
             //todo talk to christian concerning the unused properties and StopPrice
             this.NameOfTheStrategy = strategy.DisplayName;
             this.Instrument = strategy.Instrument.ToString();
@@ -1153,7 +1314,7 @@ namespace AgenaTrader.UserCode
             //this.ProfitLoss = trade.ProfitLoss;
             //this.ProfitLossPercent = trade.ProfitLossPercent;
             //this.ExitReason = trade.ExitReason;
-           
+
             //this.StopPrice = execution.Order.StopPrice;
 
             //everything is fine
@@ -1161,7 +1322,8 @@ namespace AgenaTrader.UserCode
         }
 
 
-        public void SetEntry(string entryreason, int entry_quantity, double entry_price, DateTime entry_datetime, OrderType entry_ordertype) {
+        public void SetEntry(string entryreason, int entry_quantity, double entry_price, DateTime entry_datetime, OrderType entry_ordertype)
+        {
             this.EntryReason = entryreason;
             this.EntryDateTime = entry_datetime;
             this.EntryPrice = entry_price;
@@ -1169,7 +1331,8 @@ namespace AgenaTrader.UserCode
             this.EntryOrderType = entry_ordertype;
         }
 
-        public void SetExit(string exitreason, int exit_quantity, double exit_price, DateTime exit_datetime, OrderType exit_ordertype) {
+        public void SetExit(string exitreason, int exit_quantity, double exit_price, DateTime exit_datetime, OrderType exit_ordertype)
+        {
             this.ExitReason = exitreason;
             this.ExitPrice = exit_price;
             this.ExitDateTime = exit_datetime;
@@ -1217,7 +1380,7 @@ namespace AgenaTrader.UserCode
                                             this.ProfitLoss,
                                             this.ProfitLossPercent,
                                             this.StopPrice,
-                                            this.TargetPrice                                            
+                                            this.TargetPrice
                                             );
         }
 
@@ -1230,7 +1393,8 @@ namespace AgenaTrader.UserCode
             FileInfo fi = new FileInfo(File);
             if (fi.Exists == false)
             {
-                using (StreamWriter stream = new StreamWriter(File)) {
+                using (StreamWriter stream = new StreamWriter(File))
+                {
                     stream.WriteLine(getCSVDataHeader());
                 }
             }
@@ -1250,15 +1414,15 @@ namespace AgenaTrader.UserCode
             set { _counter = value; }
         }
 
-    
-            private bool _IsValid = false;
-            public bool IsValid
-            {
-                get { return _IsValid; }
-                set { _IsValid = value; }
-            }
 
-    
+        private bool _IsValid = false;
+        public bool IsValid
+        {
+            get { return _IsValid; }
+            set { _IsValid = value; }
+        }
+
+
 
         private string _nameofthestrategy = null;
         public string NameOfTheStrategy
@@ -1319,17 +1483,18 @@ namespace AgenaTrader.UserCode
 
         public double PointsDiff
         {
-            get {
-                    //if (TradeDirection == Const.strLong)
-                    if (TradeDirection == PositionType.Long)
-                    {
-                        return ExitPrice - EntryPrice;
-                    }
-                    else
-                    {
-                        return EntryPrice - ExitPrice;
-                    }
-              }
+            get
+            {
+                //if (TradeDirection == Const.strLong)
+                if (TradeDirection == PositionType.Long)
+                {
+                    return ExitPrice - EntryPrice;
+                }
+                else
+                {
+                    return EntryPrice - ExitPrice;
+                }
+            }
         }
 
         public double PointsDiffPercentage
@@ -1338,11 +1503,11 @@ namespace AgenaTrader.UserCode
             {
                 if (TradeDirection == PositionType.Long)
                 {
-                    return 1-(EntryPrice / ExitPrice );
+                    return 1 - (EntryPrice / ExitPrice);
                 }
                 else
                 {
-                    return 1-(ExitPrice/EntryPrice);
+                    return 1 - (ExitPrice / EntryPrice);
                 }
             }
         }
@@ -1379,7 +1544,7 @@ namespace AgenaTrader.UserCode
             set { _EntryQuantity = value; }
         }
 
-        
+
 
         private double _ExitPrice = Double.MinValue;
 
@@ -1423,7 +1588,7 @@ namespace AgenaTrader.UserCode
         }
 
         private double _ProfitLossPercent = 0;
-         public double ProfitLossPercent
+        public double ProfitLossPercent
         {
             get { return _ProfitLossPercent; }
             set { _ProfitLossPercent = value; }
@@ -1527,18 +1692,18 @@ namespace AgenaTrader.UserCode
             this[GlobalUtilities.GetPropertyName(() => instrument.Currency)] = instrument.Currency;
             this["CurrentBar"] = ProcessingBarIndex;
             this[GlobalUtilities.GetPropertyName(() => bar.Time)] = bar.Time;
-   
+
             this[GlobalUtilities.GetPropertyName(() => bar.Open)] = bar.Open;
             this[GlobalUtilities.GetPropertyName(() => bar.High)] = bar.High;
             this[GlobalUtilities.GetPropertyName(() => bar.Low)] = bar.Low;
             this[GlobalUtilities.GetPropertyName(() => bar.Close)] = bar.Close;
 
             this[GlobalUtilities.GetPropertyName(() => bar.Range)] = bar.Range;
-      
+
             this[GlobalUtilities.GetPropertyName(() => bar.IsFalling)] = bar.IsFalling;
-            this[GlobalUtilities.GetPropertyName(() => bar.IsGrowing)] = bar.IsGrowing;     
+            this[GlobalUtilities.GetPropertyName(() => bar.IsGrowing)] = bar.IsGrowing;
             this[GlobalUtilities.GetPropertyName(() => bar.Volume)] = bar.Volume;
-        
+
         }
 
         /// <summary>
@@ -1673,7 +1838,7 @@ public static class IBarExtensions
 
 public static class ITradingOrderExtensions
 {
-    
+
     public static double GetThePrice(this ITradingOrder item)
     {
         double price = 0.0;
@@ -1781,7 +1946,9 @@ public static class StringExtensions
     /// <returns></returns>
     public static string CleanFileName(this String str)
     {
-        return CleanFileName(str);
+        // Aufruf der statischen Methode in GlobalUtilities (vorher rief sich die Methode selbst auf = Endlosrekursion).
+        // Voller Name nötig, weil diese Klasse außerhalb des Namespace AgenaTrader.UserCode steht.
+        return AgenaTrader.UserCode.GlobalUtilities.CleanFileName(str);
     }
 }
 #endregion
@@ -1790,6 +1957,6 @@ public static class StringExtensions
 [Category("GlobalUtility")]
 
 public class GlobalUtility : AgenaTrader.UserCode.UserIndicator
-{   
+{
     //https://www.youtube.com/watch?v=5NNOrp_83RU
 }
