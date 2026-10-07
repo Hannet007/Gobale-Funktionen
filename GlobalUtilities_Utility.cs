@@ -31,7 +31,7 @@ using System.Globalization;
 /// -------------------------------------------------------------------------
 /// Änderungen ab 2.1.0 (alle bestehenden Methodennamen bleiben unverändert):
 /// - NEU in 2.2.0: CalculatePositionSize (Menge aus Risiko-Einstellungen des Kontos und Stop-Abstand, für Aktien/ETF und CFD).
-/// /// - NEU in 2.2.1: CalculatePositionSize mit optionalem Parameter lotstep (Mengenschritt, z.B. 1000 bei Forex-CFDs).
+/// - NEU in 2.2.1: CalculatePositionSize mit optionalem Parameter lotstep (Mengenschritt, z.B. 1000 bei Forex-CFDs).
 /// - NEU in 2.3.0: CalculatePositionSize unterstützt auch Forex (InstrumentType.Currency), Mengenschritt aus den Forex-Rundungsregeln der Plattform.
 /// - StringExtensions.CleanFileName: Endlosrekursion behoben.
 /// - GetTargetBar: beliebige Minuten-/Stundenwerte, Abbruchschutz gegen Endlosschleife.
@@ -370,12 +370,18 @@ namespace AgenaTrader.UserCode
         /// <summary>
         /// Berechnet die Positionsgröße (Stückzahl) anhand der Risiko-Einstellungen der Konto-Verbindung in AgenaTrader.
         /// Unterstützt werden die Modi OnInitialRisk (Risiko in %), OnRiskAmountPerTrade (Risikobetrag) und OnAmountPerPosition (Fixbetrag)
-        /// für Aktien/ETF (Stock) und CFD. Alle Beträge werden in der Kontowährung gerechnet.
+        /// für Aktien/ETF (Stock), CFD und Forex (Currency). Alle Beträge werden in der Kontowährung gerechnet.
         /// Rückgabe 0 bedeutet: keine Order platzieren (Grund steht im Warntext).
         /// Ohne Konto (z.B. Backtest) wird die Standardmenge des Instruments zurückgegeben.
         /// </summary>
         /// <param name="entryprice">geplanter Einstiegskurs</param>
         /// <param name="stopprice">geplanter Stop-Kurs (bei Long unter, bei Short über dem Einstieg)</param>
+        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice)
+        {
+            string warning;
+            return CalculatePositionSize(accountmanager, preferencemanager, instrument, entryprice, stopprice, out warning);
+        }
+
         public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice, out string warning)
         {
             return CalculatePositionSize(accountmanager, preferencemanager, instrument, entryprice, stopprice, 1, out warning);
@@ -501,10 +507,9 @@ namespace AgenaTrader.UserCode
                 result = (result / step) * step;
             }
 
-
             if (result < 1)
             {
-                warning = "CalculatePositionSize: Kapital bzw. Risiko reicht für kein ganzes Stück, Menge 0";
+                warning = "CalculatePositionSize: Kapital bzw. Risiko reicht für kein ganzes Stück bzw. keinen ganzen Mengenschritt, Menge 0";
                 return 0;
             }
             return result;
