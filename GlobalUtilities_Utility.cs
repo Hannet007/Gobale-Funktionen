@@ -22,7 +22,7 @@ using System.Net;
 using System.Globalization;
 
 /// <summary>
-/// Version: 2.2.0 (Weiterentwicklung der Version 2.0.1)
+/// Version: 2.3.0 (Weiterentwicklung der Version 2.0.1)
 /// -------------------------------------------------------------------------
 /// Simon Pucher 2018
 /// Christian Kovar 2018
@@ -31,6 +31,8 @@ using System.Globalization;
 /// -------------------------------------------------------------------------
 /// Änderungen ab 2.1.0 (alle bestehenden Methodennamen bleiben unverändert):
 /// - NEU in 2.2.0: CalculatePositionSize (Menge aus Risiko-Einstellungen des Kontos und Stop-Abstand, für Aktien/ETF und CFD).
+/// /// - NEU in 2.2.1: CalculatePositionSize mit optionalem Parameter lotstep (Mengenschritt, z.B. 1000 bei Forex-CFDs).
+/// - NEU in 2.3.0: CalculatePositionSize unterstützt auch Forex (InstrumentType.Currency), Mengenschritt aus den Forex-Rundungsregeln der Plattform.
 /// - StringExtensions.CleanFileName: Endlosrekursion behoben.
 /// - GetTargetBar: beliebige Minuten-/Stundenwerte, Abbruchschutz gegen Endlosschleife.
 /// - AdjustPositionToRiskManagement: keine NotImplementedException mehr, stattdessen Menge 0 plus Warntext (Überladung mit out-Parameter).
@@ -374,13 +376,17 @@ namespace AgenaTrader.UserCode
         /// </summary>
         /// <param name="entryprice">geplanter Einstiegskurs</param>
         /// <param name="stopprice">geplanter Stop-Kurs (bei Long unter, bei Short über dem Einstieg)</param>
-        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice)
+        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice, out string warning)
         {
-            string warning;
-            return CalculatePositionSize(accountmanager, preferencemanager, instrument, entryprice, stopprice, out warning);
+            return CalculatePositionSize(accountmanager, preferencemanager, instrument, entryprice, stopprice, 1, out warning);
         }
 
-        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice, out string warning)
+        /// <summary>
+        /// Wie oben, mit Mengenschritt: Die Menge wird auf ein Vielfaches von lotstep abgerundet
+        /// (z.B. 1000 bei Forex-CFDs). Liegt das Ergebnis unter lotstep, wird 0 zurückgegeben.
+        /// Welcher Schritt für ein Instrument gilt, muss der Aufrufer festlegen (siehe Contract Specs des Brokers).
+        /// </summary>
+        public static int CalculatePositionSize(IAccountManager accountmanager, IPreferenceManager preferencemanager, IInstrument instrument, double entryprice, double stopprice, int lotstep, out string warning)
         {
             warning = string.Empty;
 
@@ -398,9 +404,9 @@ namespace AgenaTrader.UserCode
                 return 0;
             }
 
-            //Forex (Currency) folgt später, andere Typen werden nicht unterstützt
+            //Unterstützt: Aktien/ETF (Stock), CFD und Forex (Currency); andere Typen werden nicht unterstützt
             InstrumentType type = instrument.InstrumentType;
-            if (type != InstrumentType.Stock && type != InstrumentType.CFD)
+            if (type != InstrumentType.Stock && type != InstrumentType.CFD && type != InstrumentType.Currency)
             {
                 warning = "CalculatePositionSize: InstrumentType " + type.ToString() + " wird noch nicht unterstützt, Menge 0";
                 return 0;
@@ -478,6 +484,24 @@ namespace AgenaTrader.UserCode
 
             if (quantity > int.MaxValue) quantity = int.MaxValue;
             int result = (int)Math.Floor(quantity);
+
+            //Mengenschritt: explizit vorgegeben (lotstep) oder bei Forex aus den Rundungsregeln der Plattform
+            int step = lotstep;
+            if (step <= 1 && type == InstrumentType.Currency)
+            {
+                //unterhalb der Schwelle gilt der kleinere, oberhalb der größere Schritt (Annahme aus den Einstellungsnamen)
+                step = (result < preferencemanager.RoundForexSizeThreshold)
+                    ? preferencemanager.RoundForexSizeBelowThreshold
+                    : preferencemanager.RoundForexSizeAboveThreshold;
+            }
+
+            //Auf den Mengenschritt abrunden (z.B. Vielfache von 1000)
+            if (step > 1)
+            {
+                result = (result / step) * step;
+            }
+
+
             if (result < 1)
             {
                 warning = "CalculatePositionSize: Kapital bzw. Risiko reicht für kein ganzes Stück, Menge 0";
